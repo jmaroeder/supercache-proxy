@@ -1,0 +1,250 @@
+## Cache configuration
+proxy_cache_path /data/proxy_cache levels=1:2 keys_zone=fwd_proxy_cache:10m max_size=10g inactive=7d use_temp_path=off;
+proxy_cache_convert_head off;
+proxy_cache_methods GET HEAD POST;
+proxy_cache_lock on;
+
+## Ignore headers that make requests uncacheable
+proxy_ignore_headers Set-Cookie Vary X-Accel-Buffering;
+proxy_buffering on;
+
+
+# ====================== Expiration Rules ====================== #
+
+## Configures expiration for upstream content based on content type.
+map $upstream_http_content_type $content_type_expiry {
+    default                                 max;
+    'application/json'                      max;
+    'application/pdf'                       max;            # max means 10 years to nginx
+    'application/octet-stream'              max;
+    'binary/octet-stream'                   max;
+    'image/jpeg'                            max;
+    'image/gif'                             max;
+    'image/png'                             max;
+    'image/bmp'                             max;
+    'image/webp'                            max;
+    'video/webm'                            max;
+    'video/ogg'                             max;
+    'video/mp4'                             max;
+    'application/binary'                    -1s;            # used by HLS streams
+    '~*mpegurl'                             -1s;
+}
+
+map $host $host_expiry {
+    default                     $content_type_expiry;
+    # foo.com                   30d;                        # example of expiry by host
+    "~*uplynk.com"              -1s;                        # known HLS stream provider
+}
+
+map $uri $uri_expiry {
+    default                     $host_expiry;
+    # "~*.gifv"                 30d;                        # example of expiry by uri/file extension
+}
+
+# ====================== End Expiration Rules ====================== #
+
+
+# ====================== Client Proxy ====================== #
+
+##
+## Proxy connected to by clients (i.e. Chrome), usually using port 3128.
+##
+## Also functions as a transparent proxy using port 80 (HTTP) and 443 (HTTPS).
+##
+
+## Header to indicate proxy usage
+map $scheme $proxied_by_value {
+    "http"    "proxy";
+    "https"   "proxy-ssl";
+}
+
+## Proxy destination based on scheme
+map $scheme $normal_proxy_cache_backend {
+    "http"      http://127.0.0.1:3129;
+    "https"     http://127.0.0.1:3130;
+}
+
+map $scheme $range_proxy_cache_backend {
+    "http"      http://127.0.0.1:4481;
+    "https"     http://127.0.0.1:4444;
+}
+
+map $http_range $proxy_cache_backend {
+    default     $normal_proxy_cache_backend;
+    "~bytes=*"  $range_proxy_cache_backend;
+}
+
+server {
+    include ./transparent_proxy/*.conf;
+    listen 444 ssl;
+    listen 3128;
+
+    ssl_certificate     ./nginx.crt;
+    ssl_certificate_key ./nginx.key;
+
+    add_header Proxy-Proxied-By $proxied_by_value;
+
+    proxy_connect;
+    proxy_connect_allow                 443 563;
+
+    # read/send_timeout are used to keep the connection open to the client
+    # even if no data is sent on the proxy. Normally this is set to ~60s, but
+    # that is causing issues with the cache - it takes a long time to respond
+    # to stale requests, maybe because it's trying to use an open channel.
+    # Keeping these timeouts low seems to alleviate that problem.
+    proxy_connect_connect_timeout       10s;
+    proxy_connect_read_timeout          10s;
+    proxy_connect_send_timeout          10s;
+    proxy_connect_address               127.0.0.1:444;
+
+    location / {
+        resolver ${NAMESERVER} ipv6=off;
+
+        proxy_set_header Host            $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+
+        proxy_pass $proxy_cache_backend;
+    }
+}
+
+# ====================== End Client Proxy ====================== #
+
+
+# ====================== General Cache Proxy ====================== #
+
+map $server_port $proxy_rewrite_backend {
+    3129    http://127.0.0.1:4480;
+    3130    http://127.0.0.1:4443;
+}
+
+map $server_port $proxy_method {
+    3129    "http";
+    3130    "https";
+}
+
+server {
+    listen 3129;
+    listen 3130;
+
+    add_header Proxy-Cache-Status $upstream_cache_status;
+
+    location / {
+        proxy_set_header Host            $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+
+        proxy_pass $proxy_rewrite_backend;
+        proxy_cache fwd_proxy_cache;
+        proxy_cache_key "$proxy_method$request_method$host$uri$is_args$args$request_body$content_length";
+
+        ## This config serves stale responses when updating the cache.
+        ## Use when immediate updates are not necessary.
+        # proxy_cache_use_stale error timeout updating;
+        # proxy_cache_background_update on;
+
+        ## This config attempts to serve updated responses immediately,
+        ## serving a stale response if there is an error/timeout.
+        ## Use when immediate updates are preferred.
+        proxy_cache_use_stale error timeout http_500 http_502 http_503 http_504;
+        proxy_cache_background_update off;
+
+        # These timeouts ensure that the stale cache is used quickly if network
+        # goes down. The timeouts are for time to first byte, not entire request duration.
+        proxy_connect_timeout 1s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+
+        ## Set valid cached response types.
+        ## The time here is overridden by our injected `expires $uri_expiry` header.
+        proxy_cache_valid 200 206 1s;
+    }
+}
+
+# ====================== End General Cache Proxy ====================== #
+
+
+# ====================== Forward Proxies ====================== #
+
+##
+## HTTP and HTTPS forward proxies. These proxy requests to external upstreams
+## and set custom expiration headers to allow granular expiration rules.
+##
+
+map $server_port $forward_proxied_by_value {
+    4480 "proxy-forward";
+    4443 "proxy-ssl-forward";
+}
+
+map $server_port $forward_proxy_scheme {
+    4480 http;
+    4443 https;
+}
+
+server {
+    listen 4480;
+    listen 4443;
+
+    add_header Proxy-Proxied-By $forward_proxied_by_value;
+
+    expires $uri_expiry;
+
+    location / {
+        resolver ${NAMESERVER} ipv6=off;
+
+        proxy_pass $forward_proxy_scheme://$host$uri$is_args$args;
+
+        proxy_ssl_verify on;
+        proxy_ssl_verify_depth 2;
+        proxy_ssl_trusted_certificate ./cacert.pem;
+        proxy_ssl_server_name on;
+    }
+}
+
+
+# ====================== End Forward Proxies ====================== #
+
+
+# ====================== Range Request Cache Proxy ====================== #
+
+map $server_port $forward_range_proxied_by_value {
+    4481 "proxy-range-forward";
+    4444 "proxy-ssl-range-forward";
+}
+
+map $server_port $forward_range_proxy_scheme {
+    4481 http;
+    4444 https;
+}
+
+server {
+    listen 4481;
+    listen 4444;
+
+    add_header Proxy-Proxied-By $forward_range_proxied_by_value;
+
+    ## Settings for handling range requests
+    slice 1m;
+    proxy_set_header  Range $slice_range;
+
+    expires max;
+
+    location / {
+        resolver ${NAMESERVER} ipv6=off;
+
+        add_header Proxy-Cache-Status $upstream_cache_status;
+
+        proxy_pass $forward_range_proxy_scheme://$host$uri$is_args$args;
+        proxy_ignore_headers X-Accel-Expires Expires Cache-Control Set-Cookie Vary;
+        proxy_cache fwd_proxy_cache;
+        proxy_cache_key $forward_range_proxy_scheme$request_method$host$uri$is_args$args$slice_range;
+        proxy_cache_use_stale error timeout;
+        proxy_cache_background_update off;
+        proxy_cache_valid 200 206 3650d;
+
+        proxy_ssl_verify on;
+        proxy_ssl_verify_depth 2;
+        proxy_ssl_trusted_certificate ./cacert.pem;
+        proxy_ssl_server_name on;
+    }
+}
+
+# ====================== End Range Request Proxy/Cache ====================== #
